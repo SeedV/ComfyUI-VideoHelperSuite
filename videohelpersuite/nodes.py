@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import subprocess
 import shutil
@@ -7,6 +8,7 @@ import re
 from typing import List
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+from pathlib import Path
 
 import folder_paths
 from .logger import logger
@@ -58,6 +60,7 @@ class VideoCombine:
             },
             "optional": {
                 "save_metadata": ("BOOLEAN", {"default": True}),
+                "audio_file": ("STRING", {"default": ""}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -83,13 +86,11 @@ class VideoCombine:
         save_metadata=True,
         prompt=None,
         extra_pnginfo=None,
+        audio_file=""
     ):
         # convert images to numpy
-        frames: List[Image.Image] = []
-        for image in images:
-            img = 255.0 * image.cpu().numpy()
-            img = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
-            frames.append(img)
+        images = images.cpu().numpy() * 255.0
+        images = np.clip(images, 0, 255).astype(np.uint8)
 
         # get output information
         output_dir = (
@@ -136,18 +137,19 @@ class VideoCombine:
         # save first frame as png to keep metadata
         file = f"{filename}_{counter:05}.png"
         file_path = os.path.join(full_output_folder, file)
-        frames[0].save(
+        Image.fromarray(images[0]).save(
             file_path,
             pnginfo=metadata,
             compress_level=4,
         )
         if pingpong:
-            frames = frames + frames[-2:0:-1]
+            images = np.concatenate((images, images[-2:0:-1]))
 
         format_type, format_ext = format.split("/")
         file = f"{filename}_{counter:05}.{format_ext}"
         file_path = os.path.join(full_output_folder, file)
         if format_type == "image":
+            frames = [Image.fromarray(f) for f in images]
             # Use pillow directly to save an animated image
             frames[0].save(
                 file_path,
@@ -169,7 +171,7 @@ class VideoCombine:
                 video_format = json.load(stream)
             file = f"{filename}_{counter:05}.{video_format['extension']}"
             file_path = os.path.join(full_output_folder, file)
-            dimensions = f"{frames[0].width}x{frames[0].height}"
+            dimensions = f"{len(images[0][0])}x{len(images[0])}"
             args = [ffmpeg_path, "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
                     "-s", dimensions, "-r", str(frame_rate), "-i", "-", "-crf", str(crf) ] \
                     + video_format['main_pass']
@@ -177,6 +179,7 @@ class VideoCombine:
             env=os.environ.copy()
             if  "environment" in video_format:
                 env.update(video_format["environment"])
+            res = None
             if save_metadata:
                 os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
                 metadata = json.dumps(video_metadata)
@@ -191,12 +194,60 @@ class VideoCombine:
                 with open(metadata_path, "w") as f:
                     f.write(";FFMETADATA1\n")
                     f.write(metadata)
-                args = args[:1] + ["-i", metadata_path] + args[1:]
-            # TODO: Catch broken pipe -> instruct to check console
-            with subprocess.Popen(args + [file_path],
-                                  stdin=subprocess.PIPE, env=env) as proc:
-                for frame in frames:
-                    proc.stdin.write(frame.tobytes())
+                m_args = args[:1] + ["-i", metadata_path] + args[1:]
+                try:
+                    res = subprocess.run(m_args + [file_path], input=images.tobytes(),
+                                         capture_output=True, check=True, env=env)
+                except subprocess.CalledProcessError as e:
+                    #Res was not set
+                    print(e.stderr.decode("utf-8"), end="", file=sys.stderr)
+                    logger.warn("An error occurred when saving with metadata")
+
+            if not res:
+                try:
+                    res = subprocess.run(args + [file_path], input=images.tobytes(),
+                                         capture_output=True, check=True, env=env)
+                except subprocess.CalledProcessError as e:
+                    raise Exception("An error occured in the ffmpeg subprocess:\n" \
+                            + e.stderr.decode("utf-8"))
+            if res.stderr:
+                print(res.stderr.decode("utf-8"), end="", file=sys.stderr)
+
+
+            # Audio Injection ater video is created, saves additional video with -audio.mp4
+            # Accepts mp3 and wav formats
+            # TODO test unix and windows paths to make sure it works properly. Path module is Used
+
+            audio_file_path = Path(audio_file)
+            file_path = Path(file_path)
+
+            # Check if 'audio_file' is not empty and the file exists
+            if audio_file and audio_file_path.exists() and audio_file_path.suffix.lower() in ['.wav', '.mp3']:
+                
+                # Mapping of input extensions to output settings (extension, audio codec)
+                format_settings = {
+                    '.mov': ('.mov', 'pcm_s16le'),  # ProRes codec in .mov container
+                    '.mp4': ('.mp4', 'aac'),        # H.264/H.265 in .mp4 container
+                    '.mkv': ('.mkv', 'aac'),        # H.265 in .mkv container
+                    '.webp': ('.webp', 'libvorbis'),
+                    '.webm': ('.webm', 'libvorbis'),
+                    '.av1': ('.webm', 'libvorbis')
+                }
+
+                output_extension, audio_codec = format_settings.get(file_path.suffix.lower(), (None, None))
+
+                if output_extension and audio_codec:
+                    # Modify output file name
+                    output_file_with_audio_path = file_path.with_stem(file_path.stem + "-audio").with_suffix(output_extension)
+
+                    # FFmpeg command with audio re-encoding
+                    mux_args = [
+                        ffmpeg_path, "-y", "-i", str(file_path), "-i", str(audio_file_path),
+                        "-c:v", "copy", "-c:a", audio_codec, "-b:a", "192k", "-strict", "experimental", "-shortest", str(output_file_with_audio_path)
+                    ]
+                    
+                    subprocess.run(mux_args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                # Else block for unsupported video format can be added if necessar
 
         previews = [
             {
